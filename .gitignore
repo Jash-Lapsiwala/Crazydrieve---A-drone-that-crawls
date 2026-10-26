@@ -218,3 +218,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# MATLAB / Simulink
+*.asv
+*.autosave
+*.slxc
+slprj/
+codegen/
+*.mex*
+*_ert_rtw/
+*_grt_rtw/
+
+# Flight logs / data (keep out unless small and needed)
+logs/
+*.csv
+
+# OS
+.DS_Store
+Thumbs.db
