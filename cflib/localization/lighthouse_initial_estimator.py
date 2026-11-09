@@ -1,0 +1,461 @@
+# -*- coding: utf-8 -*-
+#
+# ,---------,       ____  _ __
+# |  ,-^-,  |      / __ )(_) /_______________ _____  ___
+# | (  O  ) |     / __  / / __/ ___/ ___/ __ `/_  / / _ \
+# | / ,--'  |    / /_/ / / /_/ /__/ /  / /_/ / / /_/  __/
+#    +------`   /_____/_/\__/\___/_/   \__,_/ /___/\___/
+#
+# Copyright (C) 2022-2026 Bitcraze AB
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, in version 3.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+from __future__ import annotations
+
+from typing import NamedTuple
+
+import numpy as np
+import numpy.typing as npt
+
+from cflib.localization.lighthouse_cf_pose_sample import BsPairPoses
+from cflib.localization.lighthouse_cf_pose_sample import LhCfPoseSampleStatus
+from cflib.localization.lighthouse_cf_pose_sample import LhCfPoseSampleWrapper
+from cflib.localization.lighthouse_geometry_solution import LighthouseGeometrySolution
+from cflib.localization.lighthouse_types import LhException
+from cflib.localization.lighthouse_types import Pose
+
+
+ArrayFloat = npt.NDArray[np.float64]
+
+
+class BsPairIds(NamedTuple):
+    """A type representing the ids of a pair of base stations"""
+    bs1: int
+    bs2: int
+
+
+class LighthouseInitialEstimator:
+    """
+    Make initial estimates of base station and CF poses using IPPE (analytical solution).
+    The estimates are not good enough to use for flight but is a starting point for further
+    calculations.
+    """
+
+    AMBIGUOUS_DETECTION_ERROR = 0.5
+
+    @classmethod
+    def estimate(cls, matched_samples: list[LhCfPoseSampleWrapper],
+                 solution: LighthouseGeometrySolution) -> list[LhCfPoseSampleWrapper]:
+        """
+        Make a rough estimate of the poses of all base stations and CF poses found in the samples.
+
+        The pose of the Crazyflie in the first sample is used as a reference and will define the
+        global reference frame.
+
+        :param matched_samples: A list of samples with lighthouse angles. It is assumed that all samples have data for
+                                two or more base stations. Note: matched_samples is a subset of solution.samples.
+
+        :param solution: A LighthouseGeometrySolution object to store progress information and issues in
+        :return: a subset of the matched_samples where ambiguous samples are removed.
+        """
+
+        bs_positions = cls._find_bs_to_bs_poses(matched_samples)
+        # bs_positions is a map from bs-id-pair to position, where the position is the position of the second
+        # bs, as seen from the first bs (in the first bs ref frame).
+
+        bs_poses_ref_cfs, cleaned_matched_samples = cls._angles_to_poses(matched_samples, bs_positions, solution)
+        cls._build_link_stats(cleaned_matched_samples, solution)
+        if not solution.progress_is_ok:
+            return cleaned_matched_samples
+
+        # Calculate the pose of all base stations, based on the pose of one base station
+        try:
+            bs_poses = cls._estimate_bs_poses(bs_poses_ref_cfs)
+        except LhException as e:
+            # At this point we might have too few base stations or we have islands of non-linked base stations.
+            solution.progress_is_ok = False
+            solution.general_failure_info = str(e)
+            return cleaned_matched_samples
+
+        # Now that we have estimated the base station poses, estimate the poses of the CF in all the samples
+        cf_poses = cls._estimate_cf_poses(bs_poses_ref_cfs, bs_poses)
+
+        # Store the results in the solution
+        for pose, sample in zip(cf_poses, cleaned_matched_samples):
+            sample.pose = pose
+        solution.bs_poses = bs_poses
+
+        return cleaned_matched_samples
+
+    @classmethod
+    def _build_link_stats(cls, matched_samples: list[LhCfPoseSampleWrapper], solution: LighthouseGeometrySolution):
+        """
+        Build statistics about the number of links between base stations, based on the matched samples.
+        :param matched_samples: List of matched samples
+        :param solution: A LighthouseGeometry Solution object to store issues in
+        """
+
+        def increase_link_count(bs1: int, bs2: int):
+            """Increase the link count between two base stations"""
+            if bs1 not in solution.link_count:
+                solution.link_count[bs1] = {}
+            if bs2 not in solution.link_count[bs1]:
+                solution.link_count[bs1][bs2] = 0
+            solution.link_count[bs1][bs2] += 1
+
+        def increase_sample_count(bs: int):
+            """Increase the sample count for a base station"""
+            if bs not in solution.bs_sample_count:
+                solution.bs_sample_count[bs] = 0
+            solution.bs_sample_count[bs] += 1
+
+        for sample in matched_samples:
+            bs_in_sample = sample.angles_calibrated.keys()
+            for bs1 in bs_in_sample:
+                increase_sample_count(bs1)
+                for bs2 in bs_in_sample:
+                    if bs1 != bs2:
+                        increase_link_count(bs1, bs2)
+
+        solution.link_count_ok_threshold = 1
+        if len(solution.link_count) > 2:
+            solution.link_count_ok_threshold = 2
+
+    @classmethod
+    def _find_bs_to_bs_poses(cls, matched_samples: list[LhCfPoseSampleWrapper]) -> dict[BsPairIds, ArrayFloat]:
+        """
+        Find the pose of all base stations, in the reference frame of other base stations.
+
+        Ippe finds two mirror solutions for each sample and the bulk of this method is geared towards finding the
+        correct one. The outline of the process is:
+        1. For each sample collect all possible permutations (4) of the base station positions
+        2. Aggregate the possible positions of all samples in clusters. This is done per base station pair.
+        3. Pick the "best" cluster as the correct permutation. The idea is that the mirror solutions will be spread
+           out in space, while the correct one will end up more or less in the same spot for all samples.
+
+        :param matched_samples: List of matched samples
+        :return: Base stations poses in the reference frame of the other base stations. The data is organized as a
+                 dictionary of tuples with base station id pairs, mapped to positions. For instance the entry with key
+                 (2, 1) contains the position of base station 1, in the base station 2 reference frame.
+        """
+
+        position_permutations: dict[BsPairIds, list[list[ArrayFloat]]] = {}
+        for sample in matched_samples:
+            cls._add_solution_permutations(sample.ippe_solutions, position_permutations)
+
+        return cls._find_most_likely_positions(position_permutations)
+
+    @classmethod
+    def _add_solution_permutations(cls, solutions: dict[int, BsPairPoses],
+                                   position_permutations: dict[BsPairIds, list[list[ArrayFloat]]]):
+        """
+        Add the possible permutations of base station positions for a sample to a collection of aggregated positions.
+        The aggregated collection contains base station positions in the reference frame of other base stations.
+
+        :param solutions: All possible positions of the base stations, in the reference frame of the Crazyflie in one
+                          sample
+        :param position_permutations: Aggregated possible solutions. A dictionary with base station pairs as keys,
+                                      mapped to lists of lists of possible positions. For instance, the entry for (2, 1)
+                                      would contain a list of lists with 4 positions each, for where base station 1
+                                      might be located in the base station 2 reference frame.
+        """
+        ids = sorted(solutions.keys())
+
+        for i, id_i in enumerate(ids):
+            solution_i = solutions[id_i]
+
+            for j in range(i + 1, len(ids)):
+                id_j = ids[j]
+
+                solution_j = solutions[id_j]
+
+                pose1 = solution_i[0].inv_rotate_translate_pose(solution_j[0])
+                pose2 = solution_i[0].inv_rotate_translate_pose(solution_j[1])
+                pose3 = solution_i[1].inv_rotate_translate_pose(solution_j[0])
+                pose4 = solution_i[1].inv_rotate_translate_pose(solution_j[1])
+
+                pair = BsPairIds(id_i, id_j)
+                if pair not in position_permutations:
+                    position_permutations[pair] = []
+                position_permutations[pair].append([pose1.translation, pose2.translation,
+                                                   pose3.translation, pose4.translation])
+
+    @classmethod
+    def _angles_to_poses(cls, matched_samples: list[LhCfPoseSampleWrapper], bs_positions: dict[BsPairIds, ArrayFloat],
+                         solution: LighthouseGeometrySolution) -> tuple[list[dict[int, Pose]],
+                                                                        list[LhCfPoseSampleWrapper]]:
+        """
+        Estimate the base station poses in the Crazyflie reference frames, for each sample.
+
+        Again use the IPPE solutions to find the possible poses of the base stations and pick the one that best matches
+        the position in bs_positions.
+
+        :param matched_samples: List of samples
+        :param bs_positions: Dictionary of base station positions (other base station ref frame)
+        :param solution: A LighthouseGeometrySolution object to store issues in
+        :return: A list of dictionaries from base station to Pose of all base stations, for each sample, as well as
+                 a version of the matched_samples where ambiguous samples are removed.
+        """
+        result: list[dict[int, Pose]] = []
+
+        cleaned_matched_samples: list[LhCfPoseSampleWrapper] = []
+        ambiguous_count = 0
+
+        for sample in matched_samples:
+            solutions = sample.ippe_solutions
+
+            poses: dict[int, Pose] = {}
+            ids = sorted(solutions.keys())
+            first = ids[0]
+            is_sample_valid = True
+
+            for other in ids[1:]:
+                pair_ids = BsPairIds(first, other)
+                expected = bs_positions[pair_ids]
+
+                success, pair_poses = cls._choose_solutions(solutions[first], solutions[other], expected)
+                if success:
+                    poses[pair_ids.bs1] = pair_poses.bs1
+                    poses[pair_ids.bs2] = pair_poses.bs2
+                else:
+                    is_sample_valid = False
+                    sample.status = LhCfPoseSampleStatus.AMBIGUOUS
+                    if sample.is_mandatory:
+                        solution.progress_is_ok = False
+                    else:
+                        ambiguous_count += 1
+                        solution.xyz_space_samples_info = f'{ambiguous_count} sample(s) with ambiguities skipped'
+                    break
+
+            if is_sample_valid or sample.is_mandatory:
+                result.append(poses)
+                cleaned_matched_samples.append(sample)
+
+        return result, cleaned_matched_samples
+
+    @classmethod
+    def _choose_solutions(cls, solutions_1: BsPairPoses, solutions_2: BsPairPoses,
+                          expected: ArrayFloat) -> tuple[bool, BsPairPoses]:
+        """Pick the base pose solutions for a pair of base stations, based on the position in expected"""
+
+        min_dist = 100000.0
+        best = BsPairPoses(Pose(), Pose())
+        success = True
+
+        for solution_1 in solutions_1:
+            for solution_2 in solutions_2:
+                pose_second_bs_ref_fr_first = solution_1.inv_rotate_translate_pose(solution_2)
+                dist = np.linalg.norm(expected - pose_second_bs_ref_fr_first.translation)
+                if dist < min_dist:
+                    min_dist = dist
+                    best = BsPairPoses(solution_1, solution_2)
+
+        if min_dist > cls.AMBIGUOUS_DETECTION_ERROR:
+            success = False
+
+        return success, best
+
+    @classmethod
+    def _find_most_likely_positions(cls, position_permutations: dict[BsPairIds,
+                                    list[list[ArrayFloat]]]) -> dict[BsPairIds, ArrayFloat]:
+        """
+        Find the most likely base station positions from all the possible permutations.
+
+        Sort the permutations into buckets based on how close they are to the solutions in the first sample. Solutions
+        that are "too" far away and discarded. The bucket with the most samples in, is considered the best.
+        """
+        result: dict[BsPairIds, ArrayFloat] = {}
+
+        for pair, position_lists in position_permutations.items():
+            # Use first as reference to map the others to
+            bucket_ref_positions = position_lists[0]
+            buckets: list[list[ArrayFloat]] = [[], [], [], []]
+
+            cls._map_positions_to_ref(bucket_ref_positions, position_lists, buckets)
+            best_pos = cls._find_best_position_bucket(buckets)
+            result[pair] = best_pos
+
+        return result
+
+    @classmethod
+    def _map_positions_to_ref(cls, bucket_ref_positions: list[ArrayFloat],
+                              position_lists: list[list[ArrayFloat]],
+                              buckets: list[list[ArrayFloat]]) -> None:
+        """
+        Sort solution into buckets based on the distance to the reference position. If no bucket is close enough,
+        the solution is discarded.
+        """
+
+        accept_radius = 0.8
+
+        for pos_list in position_lists:
+            for pos in pos_list:
+                for i, ref in enumerate(bucket_ref_positions):
+                    if np.linalg.norm(pos - ref) < accept_radius:
+                        buckets[i].append(pos)
+                        break
+
+    @classmethod
+    def _find_best_position_bucket(cls, buckets: list[list[ArrayFloat]]) -> ArrayFloat:
+        """
+        Find the bucket with the most solutions in, this is considered to be the correct solution.
+        The final result is the mean of the solution in the bucket.
+        """
+        max_len = 0
+        max_i = 0
+        for i, bucket in enumerate(buckets):
+            if len(bucket) > max_len:
+                max_len = len(bucket)
+                max_i = i
+
+        pos = np.mean(buckets[max_i], axis=0)
+        return pos
+
+    @classmethod
+    def _estimate_bs_poses(cls, bs_poses_ref_cfs: list[dict[int, Pose]]) -> dict[int, Pose]:
+        """
+        Based on one base station pose, estimate the other base station poses.
+
+        The process is iterative and runs until all poses are found. Assume we know the pose of base station 0, and we
+        have information of base station pairs (0, 2) and (2, 3), from this we can first derive the pose of 2 and after
+        that the pose of 3.
+        """
+        # Use the first CF pose as the global reference frame. The pose of the first base station (as estimated by ippe)
+        # is used as the pose that all other base stations are mapped to.
+        reference_bs_pose = None
+        for bs_pose_ref_cfs in bs_poses_ref_cfs:
+            if len(bs_pose_ref_cfs) > 0:
+                bs_id, reference_bs_pose = list(bs_pose_ref_cfs.items())[0]
+                break
+
+        if reference_bs_pose is None:
+            raise LhException('Too little data, no reference')
+        bs_poses: dict[int, Pose] = {bs_id: reference_bs_pose}
+
+        # Find all base stations in the list
+        all_bs = set()
+        for initial_est_bs_poses in bs_poses_ref_cfs:
+            all_bs.update(initial_est_bs_poses.keys())
+
+        # Remove the reference base stations that we already have the poses for
+        to_find = all_bs - bs_poses.keys()
+
+        # run through the list of samples until we manage to find them all
+        # The process is like peeling an onion, from the inside out. In each iteration we find the poses of
+        # the base stations that are closest to the ones we already have, until we have found all poses.
+        remaining_to_find = len(to_find)
+        while remaining_to_find > 0:
+            averaging_storage: dict[int, list[Pose]] = {}
+            for bs_poses_in_sample in bs_poses_ref_cfs:
+                unknown = to_find.intersection(bs_poses_in_sample.keys())
+                known = set(bs_poses.keys()).intersection(bs_poses_in_sample.keys())
+
+                # We need (at least) one known bs pose to use when transforming the other poses to the global ref frame
+                if len(known) > 0:
+                    known_bs = list(known)[0]
+
+                    # The known BS pose in the global reference frame
+                    known_global = bs_poses[known_bs]
+                    # The known BS pose in the CF reference frame (of this sample)
+                    known_cf = bs_poses_in_sample[known_bs]
+
+                    for bs_id in unknown:
+                        # The unknown BS pose in the CF reference frame (of this sample)
+                        unknown_cf = bs_poses_in_sample[bs_id]
+                        # Finally we can calculate the BS pose in the global reference frame
+                        bs_pose = cls._map_pose_to_ref_frame(known_global, known_cf, unknown_cf)
+                        if bs_id not in averaging_storage:
+                            averaging_storage[bs_id] = []
+                        averaging_storage[bs_id].append(bs_pose)
+
+            # Average over poses and add to bs_poses
+            for bs_id, poses in averaging_storage.items():
+                bs_poses[bs_id] = cls._average_poses(poses)
+
+            # Remove the newly found base stations from the set of base stations to find
+            to_find = all_bs - bs_poses.keys()
+            if len(to_find) == 0:
+                break
+
+            if len(to_find) == remaining_to_find:
+                # We could not map any more poses, but some still remain to be found. This means that there are not
+                # links to all base stations.
+                raise LhException('Can not link positions between all base stations')
+
+            remaining_to_find = len(to_find)
+
+        return bs_poses
+
+    @classmethod
+    def _average_poses(cls, poses: list[Pose]) -> Pose:
+        """
+        Averaging of quaternions to get the "average" orientation of multiple samples.
+        From https://stackoverflow.com/a/61013769
+        """
+        def q_average(Q, W=None):
+            if W is not None:
+                Q = Q * W[:, None]
+            _, eigvecs = np.linalg.eigh(Q.T @ Q)
+            return eigvecs[:, -1]
+
+        positions = map(lambda x: x.translation, poses)
+        average_pos = np.average(np.array(list(positions)), axis=0)
+
+        quats = map(lambda x: x.rot_quat, poses)
+        average_quaternion = q_average(np.array(list(quats)))
+
+        return Pose.from_quat(R_quat=average_quaternion, t_vec=average_pos)
+
+    @classmethod
+    def _estimate_cf_poses(cls, bs_poses_ref_cfs: list[dict[int, Pose]], bs_poses: dict[int, Pose]) -> list[Pose]:
+        """
+        Find the pose of the Crazyflie in all samples, based on the base station poses.
+        """
+        cf_poses: list[Pose] = []
+
+        for est_ref_cf in bs_poses_ref_cfs:
+            # Average the global pose based on all base stations
+            poses = []
+            for bs_id, pose_cf in est_ref_cf.items():
+                pose_global = bs_poses[bs_id]
+                est_ref_global = cls._map_cf_pos_to_cf_pos(pose_global, pose_cf)
+                poses.append(est_ref_global)
+
+            cf_poses.append(cls._average_poses(poses))
+
+        return cf_poses
+
+    @classmethod
+    def _map_pose_to_ref_frame(cls, pose1_ref1: Pose, pose1_ref2: Pose, pose2_ref2: Pose) -> Pose:
+        """
+        Express pose2 in reference system 1, given pose1 in both reference system 1 and 2
+        """
+        R_o2_in_1, t_o2_in_1 = cls._map_cf_pos_to_cf_pos(pose1_ref1, pose1_ref2).matrix_vec
+
+        t = np.dot(R_o2_in_1, pose2_ref2.translation) + t_o2_in_1
+        R = np.dot(R_o2_in_1, pose2_ref2.rot_matrix)
+
+        return Pose(R, t)
+
+    @classmethod
+    def _map_cf_pos_to_cf_pos(cls, pose1_ref1: Pose, pose1_ref2: Pose) -> Pose:
+        """
+        Find the rotation/translation from ref1 to ref2 given a pose,
+        that is the returned Pose will tell us where the origin in ref2 is,
+        expressed in ref1
+        """
+
+        R_inv_ref2 = np.matrix.transpose(pose1_ref2.rot_matrix)
+        R = np.dot(pose1_ref1.rot_matrix, R_inv_ref2)
+        t = pose1_ref1.translation - np.dot(R, pose1_ref2.translation)
+
+        return Pose(R, t)

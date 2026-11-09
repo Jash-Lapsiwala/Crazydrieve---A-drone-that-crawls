@@ -1,0 +1,279 @@
+# -*- coding: utf-8 -*-
+#
+# ,---------,       ____  _ __
+# |  ,-^-,  |      / __ )(_) /_______________ _____  ___
+# | (  O  ) |     / __  / / __/ ___/ ___/ __ `/_  / / _ \
+# | / ,--'  |    / /_/ / / /_/ /__/ /  / /_/ / / /_/  __/
+#    +------`   /_____/_/\__/\___/_/   \__,_/ /___/\___/
+#
+# Copyright (C) 2021-2026 Bitcraze AB
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, in version 3.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+from collections.abc import Callable
+from threading import Timer
+
+from cflib.crazyflie import Crazyflie
+from cflib.localization import LighthouseBsVector
+from cflib.localization.lighthouse_bs_vector import LighthouseBsVectors
+from cflib.localization.lighthouse_cf_pose_sample import LhCfPoseSample
+
+
+class LighthouseSweepAngleReader():
+    """
+    Wrapper to simplify reading of lighthouse sweep angles from the locSrv stream
+    """
+    ANGLE_STREAM_PARAM = 'locSrv.enLhAngleStream'
+    NR_OF_SENSORS = 4
+
+    def __init__(self, cf: Crazyflie, data_recevied_cb):
+        self._cf = cf
+        self._cb = data_recevied_cb
+        self._is_active = False
+
+    def start(self):
+        """Start reading sweep angles"""
+        self._cf.loc.receivedLocationPacket.add_callback(self._packet_received_cb)
+        self._angle_stream_activate(True)
+        self._is_active = True
+
+    def stop(self):
+        """Stop reading sweep angles"""
+        if self._is_active:
+            self._is_active = False
+            self._cf.loc.receivedLocationPacket.remove_callback(self._packet_received_cb)
+            self._angle_stream_activate(False)
+
+    def _angle_stream_activate(self, is_active: bool):
+        value = 0
+        if is_active:
+            value = 1
+        self._cf.param.set_value(self.ANGLE_STREAM_PARAM, value)
+
+    def _packet_received_cb(self, packet):
+        if packet.type != self._cf.loc.LH_ANGLE_STREAM:
+            return
+
+        if self._cb:
+            base_station_id: int = packet.data['basestation']
+            horiz_angles: float = packet.data['x']
+            vert_angles: float = packet.data['y']
+
+            result: list[LighthouseBsVector] = []
+            for i in range(self.NR_OF_SENSORS):
+                result.append(LighthouseBsVector(horiz_angles[i], vert_angles[i]))
+
+            self._cb(base_station_id, LighthouseBsVectors(result))
+
+
+class LighthouseSweepAngleAverageReader():
+    """
+    Helper class to make it easy read sweep angles for multiple base stations and average the result
+    """
+
+    def __init__(self, cf: Crazyflie, ready_cb: Callable[[dict[int, tuple[int, LighthouseBsVectors]]], None]):
+        self._reader = LighthouseSweepAngleReader(cf, self._data_recevied_cb)
+        self._ready_cb = ready_cb
+        self.nr_of_samples_required = 50
+
+        # We store all samples in the storage for averaging when data is collected
+        # The storage is a dictionary keyed on the base station channel
+        # Each entry is a list of 4 lists, one per sensor.
+        # Each list contains LighthouseBsVector objects, representing the sampled sweep angles
+        self._sample_storage: dict[int, list[list[LighthouseBsVector]]] | None = None
+
+    def start_angle_collection(self):
+        """
+        Start collecting angles. The process will terminate when nr_of_samples_required have been
+        received
+        """
+        self._sample_storage = {}
+        self._reader.start()
+
+    def stop_angle_collection(self):
+        """Premature stop of data collection"""
+        self._reader.stop()
+        self._sample_storage = None
+
+    def is_collecting(self):
+        """True if data collection is in progress"""
+        return self._sample_storage is not None
+
+    def _data_recevied_cb(self, base_station_id: int, bs_vectors: list[LighthouseBsVector]):
+        if self._sample_storage is not None:
+            self._store_sample(base_station_id, bs_vectors, self._sample_storage)
+            if self._has_collected_enough_data(self._sample_storage):
+                self._reader.stop()
+                if self._ready_cb:
+                    averages = self._average_all_lists(self._sample_storage)
+                    self._ready_cb(averages)
+                self._sample_storage = None
+
+    def _store_sample(self, base_station_id: int, bs_vectors: list[LighthouseBsVector],
+                      storage: dict[int, list[list[LighthouseBsVector]]]):
+        if base_station_id not in storage:
+            storage[base_station_id] = []
+            for sensor in range(self._reader.NR_OF_SENSORS):
+                storage[base_station_id].append([])
+
+        for sensor in range(self._reader.NR_OF_SENSORS):
+            storage[base_station_id][sensor].append(bs_vectors[sensor])
+
+    def _has_collected_enough_data(self, storage: dict[int, list[list[LighthouseBsVector]]]):
+        for sample_list in storage.values():
+            if len(sample_list[0]) >= self.nr_of_samples_required:
+                return True
+        return False
+
+    def _average_all_lists(self, storage: dict[int, list[list[LighthouseBsVector]]]
+                           ) -> dict[int, tuple[int, LighthouseBsVectors]]:
+        result: dict[int, tuple[int, LighthouseBsVectors]] = {}
+
+        for bs_id, sample_lists in storage.items():
+            averages = self._average_sample_lists(sample_lists)
+            count = len(sample_lists[0])
+            result[bs_id] = (count, averages)
+
+        return result
+
+    def _average_sample_lists(self, sample_lists: list[list[LighthouseBsVector]]) -> LighthouseBsVectors:
+        result: list[LighthouseBsVector] = []
+
+        for i in range(self._reader.NR_OF_SENSORS):
+            result.append(self._average_sample_list(sample_lists[i]))
+
+        return LighthouseBsVectors(result)
+
+    def _average_sample_list(self, sample_list: list[LighthouseBsVector]) -> LighthouseBsVector:
+        sum_horiz = 0.0
+        sum_vert = 0.0
+
+        for bs_vector in sample_list:
+            sum_horiz += bs_vector.lh_v1_horiz_angle
+            sum_vert += bs_vector.lh_v1_vert_angle
+
+        count = len(sample_list)
+        return LighthouseBsVector(sum_horiz / count, sum_vert / count)
+
+
+class LighthouseMatchedSweepAngleReader():
+    """
+    Wrapper to simplify reading of matched lighthouse sweep angles from the locSrv stream
+    """
+    MATCHED_STREAM_PARAM = 'locSrv.enLhMtchStm'
+    MATCHED_STREAM_MIN_BS_PARAM = 'locSrv.minBsLhMtchStm'
+    MATCHED_STREAM_MAX_TIME_PARAM = 'locSrv.maxTimeLhMtchStm'
+    NR_OF_SENSORS = 4
+
+    def __init__(self, cf: Crazyflie, data_recevied_cb, timeout_cb=None, sample_count: int = 1, min_bs: int = 2,
+                 max_time_ms: int = 25):
+        self._cf = cf
+        self._data_cb = data_recevied_cb
+        self._timeout_cb = timeout_cb
+        self._is_active = False
+        self._sample_count = sample_count
+        self._sample_count_remaining = 0
+
+        # The maximum number of base stations is limited in the CF due to memory considerations.
+        if min_bs > 4:
+            raise ValueError('Minimum base station count must be 4 or less')
+        self._min_bs = min_bs
+
+        self._max_time_ms = max_time_ms
+
+        self._current_group_id = 0
+        self._angles: dict[int, LighthouseBsVectors] = {}
+
+        self._timeout_timer = None
+
+    def start(self, timeout: float = 0.0):
+        """Start reading sweep angles
+
+        Args:
+            timeout (float): timeout in seconds, 0.0 means no timeout
+        """
+        self._cf.loc.receivedLocationPacket.add_callback(self._packet_received_cb)
+        self._is_active = True
+        self._angle_stream_activate(True)
+        self._sample_count_remaining = self._sample_count
+
+        self._clear_timer()
+        self._timeout_timer = Timer(timeout, self._timer_done_cb)
+        self._timeout_timer.start()
+
+    def stop(self):
+        """Stop reading sweep angles"""
+        if self._is_active:
+            self._is_active = False
+            self._clear_timer()
+            self._cf.loc.receivedLocationPacket.remove_callback(self._packet_received_cb)
+            self._angle_stream_activate(False)
+
+    def _clear_timer(self):
+        if self._timeout_timer is not None:
+            self._timeout_timer.cancel()
+            self._timeout_timer = None
+
+    def _timer_done_cb(self):
+        self.stop()
+        if self._timeout_cb:
+            self._timeout_cb()
+
+    def _angle_stream_activate(self, is_active: bool):
+        value = 0
+        if is_active:
+            value = self._sample_count
+        self._cf.param.set_value(self.MATCHED_STREAM_PARAM, value)
+
+        self._cf.param.set_value(self.MATCHED_STREAM_MIN_BS_PARAM, self._min_bs)
+        self._cf.param.set_value(self.MATCHED_STREAM_MAX_TIME_PARAM, self._max_time_ms)
+
+    def _packet_received_cb(self, packet):
+        if self._is_active:
+            if packet.type != self._cf.loc.LH_MATCHED_ANGLE_STREAM:
+                return
+
+            base_station_id: int = packet.data['basestation']
+            horiz_angles: float = packet.data['x']
+            vert_angles: float = packet.data['y']
+            group_id: int = packet.data['group_id']
+            bs_count: int = packet.data['bs_count']
+
+            if group_id != self._current_group_id:
+                if len(self._angles) >= self._min_bs:
+                    # We have enough angles in the previous group even though all angles were not received
+                    # Lost a packet?
+                    self._call_data_callback()
+
+                # Reset
+                self._current_group_id = group_id
+                self._angles = {}
+
+            vectors: list[LighthouseBsVector] = []
+            for i in range(self.NR_OF_SENSORS):
+                vectors.append(LighthouseBsVector(horiz_angles[i], vert_angles[i]))
+            self._angles[base_station_id] = LighthouseBsVectors(vectors)
+
+            if len(self._angles) == bs_count:
+                # We have received all angles for this group, call the callback
+                self._call_data_callback()
+
+            if self._sample_count_remaining <= 0:
+                # We have received enough samples, stop the reader
+                self.stop()
+
+    def _call_data_callback(self):
+        self._sample_count_remaining -= 1
+
+        if self._data_cb:
+            self._data_cb(LhCfPoseSample(self._angles))
+            self._angles = {}
