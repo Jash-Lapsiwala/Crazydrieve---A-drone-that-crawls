@@ -16,9 +16,10 @@ from cflib.positioning.motion_commander import MotionCommander
 
 URI = "radio://0/80/2M"
 
-MIN_PROMINENCE_M = 0.025     # a dip and the rise after it must exceed this (keep above sensor noise)
-MAX_VALID_RANGE_M = 3.0     # ignore out-of-range readings from the sensor
-PRINT_ZRANGE = False        # print every raw zrange reading to the terminal
+# Table-edge detection now runs in the firmware (localMin module). This is the
+# range jump between two consecutive ToF readings that counts as an edge. Set it
+# to about half the table height; it is sent to localMin.stepThresh each flight.
+STEP_THRESH_M = 0.15
 FORWARD_M = 2.0             # distance of the forward leg in meters
 
 # True: the kill switch also sends the firmware's emergency stop, which locks the
@@ -59,8 +60,15 @@ LOG_GROUPS = [
         ("controller.cmd_pitch", "float"),
         ("controller.cmd_yaw", "float"),
     ]),
+    # Raw downward ToF range in mm. Best data for tuning STEP_THRESH_M.
     ("Zrange", 10, [
         ("range.zrange", "uint16_t"),
+    ]),
+    # Firmware table-edge module. Names must match the LOG_GROUP in the .c file.
+    ("LocalMin", 20, [
+        ("localMin.target", "float"),
+        ("localMin.overTable", "uint8_t"),
+        ("localMin.count", "uint8_t"),
     ]),
 ]
 
@@ -290,71 +298,25 @@ class KillSwitch:
         threading.Thread(target=listen, daemon=True).start()
 
 
-class LocalMinDetector:
-    """Finds local minima in a noisy signal.
-
-    A minimum is confirmed only after the signal has fallen by at least
-    `prominence` from the previous peak AND then risen by at least `prominence`
-    from the lowest point. That way sensor noise smaller than `prominence`
-    never triggers it. Confirmation therefore lags the true minimum by the
-    time the signal takes to rise `prominence`.
-    """
-
-    def __init__(self, prominence):
-        self.p = prominence
-        self.direction = 0      # 0 = not yet known, -1 = falling, +1 = rising
-        self.lo = None          # lowest value seen (used while direction == 0)
-        self.hi = None          # highest value seen (used while direction == 0)
-        self.ext = None         # running extreme once a direction is known
-
-    def update(self, z):
-        """Feed one sample. Returns the minimum value when one is confirmed, else None."""
-        if self.direction == 0:
-            self.lo = z if self.lo is None else min(self.lo, z)
-            self.hi = z if self.hi is None else max(self.hi, z)
-            if z > self.lo + self.p:
-                self.direction, self.ext = +1, z
-            elif z < self.hi - self.p:
-                self.direction, self.ext = -1, z
-            return None
-
-        if self.direction == -1:                     # falling: track the lowest point
-            if z < self.ext:
-                self.ext = z
-            elif z > self.ext + self.p:              # rose enough -> minimum confirmed
-                z_min = self.ext
-                self.direction, self.ext = +1, z
-                return z_min
-        else:                                        # rising: track the highest point
-            if z > self.ext:
-                self.ext = z
-            elif z < self.ext - self.p:              # fell enough -> now looking for a minimum
-                self.direction, self.ext = -1, z
-        return None
+def set_param(scf, name, value):
+    """Set a firmware parameter. Failures are printed instead of raised so a failed
+    write (e.g. after an emergency stop) never breaks the cleanup code."""
+    try:
+        scf.cf.param.set_value(name, str(value))
+    except Exception as e:
+        print(f"Could not set {name}:", repr(e))
 
 
-def make_step_callback(mc, recorder, kill):
-    detector = LocalMinDetector(MIN_PROMINENCE_M)
+def make_localmin_callback(recorder):
+    """Marks each table edge reported by the firmware in the Excel event column."""
+    last = {"count": None}
 
     def on_data(timestamp, data, logconf):
-        if kill.triggered.is_set():
-            return                                   # never command anything after a kill
-        raw_mm = data['range.zrange']
-        z = raw_mm / 1000.0                          # mm to m
-        if PRINT_ZRANGE:
-            print(f"t={timestamp} ms  zrange={raw_mm} mm ({z:.3f} m)")
-        if z <= 0.0 or z > MAX_VALID_RANGE_M:
-            return                                   # invalid reading
-
-        z_min = detector.update(z)
-        if z_min is not None:
-            print(f"Local minimum {z_min:.3f} m confirmed at t={timestamp} ms "
-                  f"(current reading {z:.3f} m)")
-            try:
-                mc.adjust_height(z_min)
-                recorder.mark(f"adjust_height({z_min:.3f}) at local minimum")
-            except Exception as e:
-                print("adjust_height failed:", repr(e))
+        c = data["localMin.count"]
+        if last["count"] is not None and c != last["count"]:
+            what = "entered table" if data["localMin.overTable"] else "left table"
+            recorder.mark(f"{what} (target {data['localMin.target']:.3f} m)")
+        last["count"] = c
 
     return on_data
 
@@ -388,12 +350,20 @@ def main(kill):
                 with mc:
                     recorder.mark("hovering")
 
-                    zlg = recorder.log_configs.get("Zrange")
-                    step_cb = make_step_callback(mc, recorder, kill)
-                    if zlg is not None:
-                        zlg.data_received_cb.add_callback(step_cb)
+                    llg = recorder.log_configs.get("LocalMin")
+                    lm_cb = make_localmin_callback(recorder)
+                    if llg is not None:
+                        llg.data_received_cb.add_callback(lm_cb)
+                    else:
+                        print("WARNING: no LocalMin log block")
 
                     try:
+                        # Threshold first, so the first enabled tick already uses it.
+                        # The firmware detector starts fresh when enabled.
+                        set_param(scf, "localMin.stepThresh", STEP_THRESH_M)
+                        set_param(scf, "localMin.enable", 1)
+                        recorder.mark(f"localMin enabled (stepThresh {STEP_THRESH_M} m)")
+
                         kill.sleep(5.0)
 
                         # Same as mc.forward(), but the wait can be interrupted
@@ -404,10 +374,11 @@ def main(kill):
 
                         kill.sleep(10.0)
                     finally:
-                        # Stop height compensation before landing, otherwise the
-                        # falling zrange readings would fight the landing.
-                        if zlg is not None:
-                            zlg.data_received_cb.remove_callback(step_cb)
+                        # Disable before landing, otherwise the override would keep
+                        # holding the table height while the descent starts.
+                        set_param(scf, "localMin.enable", 0)
+                        if llg is not None:
+                            llg.data_received_cb.remove_callback(lm_cb)
                         recorder.mark("aborted" if kill.triggered.is_set() else "landing")
 
                 recorder.mark("landed")
