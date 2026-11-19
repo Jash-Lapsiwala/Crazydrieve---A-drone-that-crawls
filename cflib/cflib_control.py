@@ -342,6 +342,7 @@ def main(kill):
             try:
                 # Create the commander first so the kill switch can reach it
                 # even while take-off (which blocks for several seconds) is running.
+                #scf.cf.param.set_value("posCtlPid.zKd", "0.5")
                 mc = MotionCommander(scf, default_height=1.25)
                 kill.arm(scf.cf, mc, recorder)
 
@@ -361,6 +362,7 @@ def main(kill):
                         # Threshold first, so the first enabled tick already uses it.
                         # The firmware detector starts fresh when enabled.
                         set_param(scf, "localMin.stepThresh", STEP_THRESH_M)
+                        
                         set_param(scf, "localMin.enable", 1)
                         recorder.mark(f"localMin enabled (stepThresh {STEP_THRESH_M} m)")
 
@@ -368,9 +370,9 @@ def main(kill):
 
                         # Same as mc.forward(), but the wait can be interrupted
                         recorder.mark(f"forward {FORWARD_M} m")
-                        mc.start_forward()
+                        #mc.start_forward()
                         kill.sleep(FORWARD_M / MotionCommander.VELOCITY)
-                        mc.stop()
+                        #mc.stop()
 
                         kill.sleep(10.0)
                     finally:
@@ -423,3 +425,20 @@ if __name__ == "__main__":
         fly_loop(kill)
     except KeyboardInterrupt:
         print("Exiting")
+
+
+
+        with SyncCrazyflie(URI, cf=Crazyflie(rw_cache="./cache")) as scf:
+            print("Taking off...")
+            with MotionCommander(scf, default_height=1.0) as mc:
+
+                time.sleep(5.0)
+                
+                print("Moving forward...")
+                mc.forward(1.0)
+                
+                time.sleep(2.0)
+                
+                print("Landing...")
+                lg.stop()
+                lg.delete()
