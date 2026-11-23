@@ -10,6 +10,8 @@ from statistics import median
 
 from openpyxl import Workbook
 
+from getDir import getDir
+
 import cflib.crtp as crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
@@ -24,7 +26,7 @@ PRINT_ZRANGE = False        # print every raw zrange reading to the terminal
 FORWARD_M = 2.5             # distance of the forward leg in meters
 
 # LQR gain matrix K #####################################################################################################
-K_FILE = "C:\\Users\\lapsi\\Documents\\Work\\Assignments\\24-774\\Project\\MATLAB\\Quadcopter_Simulation_WSK\\K.csv"
+K_FILE = getDir()
 
 def load_gains(path=K_FILE):
     with open(path) as f:
