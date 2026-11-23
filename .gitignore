@@ -231,7 +231,6 @@ codegen/
 
 # Flight logs / data (keep out unless small and needed)
 logs/
-*.csv
 
 # OS
 .DS_Store
