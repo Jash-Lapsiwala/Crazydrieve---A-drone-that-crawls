@@ -5,6 +5,7 @@ import traceback
 from bisect import bisect_left
 from bisect import bisect_right
 from datetime import datetime
+from statistics import median
 
 from openpyxl import Workbook
 
@@ -12,17 +13,14 @@ import cflib.crtp as crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
 from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
-from cflib.positioning.motion_commander import MotionCommander
+from cflib.positioning.motion_commander import MotionCommander 
 
 URI = "radio://0/80/2M"
 
-LQR_SETTLE_S = 3.0 
-
-# Table-edge detection now runs in the firmware (localMin module). This is the
-# range jump between two consecutive ToF readings that counts as an edge. Set it
-# to about half the table height; it is sent to localMin.stepThresh each flight.
-STEP_THRESH_M = 0.15
-FORWARD_M = 2.0             # distance of the forward leg in meters
+MIN_PROMINENCE_M = 0.025     # a dip and the rise after it must exceed this (keep above sensor noise)
+MAX_VALID_RANGE_M = 3.0     # ignore out-of-range readings from the sensor
+PRINT_ZRANGE = False        # print every raw zrange reading to the terminal
+FORWARD_M = 2.5             # distance of the forward leg in meters
 
 # True: the kill switch also sends the firmware's emergency stop, which locks the
 # motors until the Crazyflie is power-cycled. False: it only sends a stop setpoint.
@@ -62,22 +60,8 @@ LOG_GROUPS = [
         ("controller.cmd_pitch", "float"),
         ("controller.cmd_yaw", "float"),
     ]),
-    # Raw downward ToF range in mm. Best data for tuning STEP_THRESH_M.
     ("Zrange", 10, [
         ("range.zrange", "uint16_t"),
-    ]),
-    # Firmware table-edge module. Names must match the LOG_GROUP in the .c file.
-    ("LocalMin", 20, [
-        ("localMin.target", "float"),
-        ("localMin.overTable", "uint8_t"),
-        ("localMin.count", "uint8_t"),
-    ]),
-    
-        ("LQR", 20, [
-        ("lqr.cmd_thrust", "float"),
-        ("lqr.dT", "float"),
-        ("lqr.tauX", "float"),
-        ("lqr.tauY", "float"),
     ]),
 ]
 
@@ -307,40 +291,82 @@ class KillSwitch:
         threading.Thread(target=listen, daemon=True).start()
 
 
-def set_param(scf, name, value):
-    """Set a firmware parameter. Failures are printed instead of raised so a failed
-    write (e.g. after an emergency stop) never breaks the cleanup code."""
-    try:
-        scf.cf.param.set_value(name, str(value))
-    except Exception as e:
-        print(f"Could not set {name}:", repr(e))
+class LocalMinDetector:
+    """Finds local minima in a noisy signal.
+
+    A minimum is confirmed only after the signal has fallen by at least
+    `prominence` from the previous peak AND then risen by at least `prominence`
+    from the lowest point. That way sensor noise smaller than `prominence`
+    never triggers it. Confirmation therefore lags the true minimum by the
+    time the signal takes to rise `prominence`.
+    """
+
+    def __init__(self, prominence):
+        self.p = prominence
+        self.direction = 0      # 0 = not yet known, -1 = falling, +1 = rising
+        self.lo = None          # lowest value seen (used while direction == 0)
+        self.hi = None          # highest value seen (used while direction == 0)
+        self.ext = None         # running extreme once a direction is known
+
+    def update(self, z):
+        """Feed one sample. Returns the minimum value when one is confirmed, else None."""
+        if self.direction == 0:
+            self.lo = z if self.lo is None else min(self.lo, z)
+            self.hi = z if self.hi is None else max(self.hi, z)
+            if z > self.lo + self.p:
+                self.direction, self.ext = +1, z
+            elif z < self.hi - self.p:
+                self.direction, self.ext = -1, z
+            return None
+
+        if self.direction == -1:                     # falling: track the lowest point
+            if z < self.ext:
+                self.ext = z
+            elif z > self.ext + self.p:              # rose enough -> minimum confirmed
+                z_min = self.ext
+                self.direction, self.ext = +1, z
+                return z_min
+        else:                                        # rising: track the highest point
+            if z > self.ext:
+                self.ext = z
+            elif z < self.ext - self.p:              # fell enough -> now looking for a minimum
+                self.direction, self.ext = -1, z
+        return None
+
+def latest_range_m(recorder, n=3):
+    vals = [r[2] for r in recorder.rows["Zrange"][-n:] if 0 < r[2] < 3000]   # raw mm
+    return median(vals) / 1000.0 if vals else None
+
+def latest_x(recorder):
+    rows = recorder.rows["Pose"]
+    return rows[-1][2] if rows else None
 
 
-def make_localmin_callback(recorder):
-    """Marks each table edge reported by the firmware in the Excel event column."""
-    last = {"count": None}
+def make_step_callback(mc, recorder, kill):
+    detector = LocalMinDetector(MIN_PROMINENCE_M)
 
     def on_data(timestamp, data, logconf):
-        c = data["localMin.count"]
-        if last["count"] is not None and c != last["count"]:
-            what = "entered table" if data["localMin.overTable"] else "left table"
-            recorder.mark(f"{what} (target {data['localMin.target']:.3f} m)")
-        last["count"] = c
+        if kill.triggered.is_set():
+            return                                   # never command anything after a kill
+        raw_mm = data['range.zrange']
+        z = raw_mm / 1000.0                          # mm to m
+        if PRINT_ZRANGE:
+            print(f"t={timestamp} ms  zrange={raw_mm} mm ({z:.3f} m)")
+        if z <= 0.0 or z > MAX_VALID_RANGE_M:
+            return                                   # invalid reading
+
+        z_min = detector.update(z)
+        if z_min is not None:
+            print(f"Local minimum {z_min:.3f} m confirmed at t={timestamp} ms "
+                  f"(current reading {z:.3f} m)")
+            try:
+                mc.adjust_height(z_min)
+                recorder.mark(f"adjust_height({z_min:.3f}) at local minimum")
+            except Exception as e:
+                print("adjust_height failed:", repr(e))
 
     return on_data
 
-def make_lqr_print_callback():
-    """Prints the LQR output every 0.5 s (25 samples at 20 ms)."""
-    n = {"i": 0}
-
-    def on_data(timestamp, data, logconf):
-        n["i"] += 1
-        if n["i"] % 25 == 0:
-            print(f"LQR thrust {data['lqr.cmd_thrust']:6.0f}  "
-                  f"dT {data['lqr.dT']:+.3f} N  "
-                  f"tauX {data['lqr.tauX']:+.4f}  tauY {data['lqr.tauY']:+.4f}")
-
-    return on_data
 
 def check_uri():
     available = crtp.scan_interfaces()
@@ -352,7 +378,7 @@ def check_uri():
         print(f"Available URI: {uri} ({name})")
 
 
-def main(kill, use_lqr):
+def main(kill):
     recorder = FlightRecorder()
     filename = f"flight_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
 
@@ -360,84 +386,56 @@ def main(kill, use_lqr):
         print(f"Connecting to {URI}...")
         with SyncCrazyflie(URI, cf=Crazyflie(rw_cache="./cache")) as scf:
             recorder.start(scf)
-
-            # Drone console (DEBUG_PRINT) in this terminal, e.g. "CTRL: LQR ON"
-            scf.cf.console.receivedChar.add_callback(
-                lambda text: print(f"[drone] {text}", end=""))
-
-            # Always start on the PID, whatever the drone was left on
-            set_param(scf, "lqr.use", 0)
-
+            #scf.cf.param.set_value("localMin.enable", "0")
+            #scf.cf.param.set_value("rangeFusion.enable", "1")
+            scf.cf.param.set_value("lqr.use", "1")
             try:
                 # Create the commander first so the kill switch can reach it
                 # even while take-off (which blocks for several seconds) is running.
-                #scf.cf.param.set_value("posCtlPid.zKd", "0.5")
                 mc = MotionCommander(scf, default_height=1.25)
                 kill.arm(scf.cf, mc, recorder)
 
-                # recorder.mark("takeoff")
-                # kill.check()
-                if use_lqr:
-                    set_param(scf, "lqr.use", 1)          # LQR for the whole flight
-                    recorder.mark("LQR on")
                 recorder.mark("takeoff")
                 kill.check()
                 with mc:
                     recorder.mark("hovering")
 
-                    llg = recorder.log_configs.get("LocalMin")
-                    lm_cb = make_localmin_callback(recorder)
-                    if llg is not None:
-                        llg.data_received_cb.add_callback(lm_cb)
-                    else:
-                        print("WARNING: no LocalMin log block")
-
-                    lqr_lg = recorder.log_configs.get("LQR")
-                    lqr_cb = make_lqr_print_callback()
-                    if lqr_lg is not None:
-                        lqr_lg.data_received_cb.add_callback(lqr_cb)
-                    else:
-                        print("WARNING: no LQR log block (is the LQR firmware flashed?)")
-
                     try:
-                        # Threshold first, so the first enabled tick already uses it.
-                        # The firmware detector starts fresh when enabled.
-                        set_param(scf, "localMin.stepThresh", STEP_THRESH_M)
-
-                        set_param(scf, "localMin.enable", 1)
-                        recorder.mark(f"localMin enabled (stepThresh {STEP_THRESH_M} m)")
-
-                        # if use_lqr:
-                        #     kill.sleep(LQR_SETTLE_S)          # settle on the PID first
-                        #     set_param(scf, "lqr.use", 1)
-                        #     recorder.mark("LQR on")
-                        #     kill.sleep(5.0 - LQR_SETTLE_S)
-                        # else:
-                        #     kill.sleep(5.0)
                         kill.sleep(5.0)
 
-                        # Same as mc.forward(), but the wait can be interrupted
-                        recorder.mark(f"forward {FORWARD_M} m")
-                        #mc.start_forward()
-                        kill.sleep(FORWARD_M / MotionCommander.VELOCITY)
-                        #mc.stop()
 
-                        kill.sleep(10.0)
+                        # start moving forward
+                        recorder.mark("Moving Forward")
+                        xref = latest_x(recorder)
+                        mc.start_forward()
+
+                        # go half the distance
+                        while((latest_x(recorder)-xref) < FORWARD_M * (0.5)):
+                            kill.sleep(0.01)
+
+                        # # disable range fusion
+                        # recorder.mark("Disable RangerDeck")
+                        # scf.cf.param.set_value("rangeFusion.enable", 0)
+                        
+                        # # go a quarter of the distance
+                        # while((latest_x(recorder)-xref) < FORWARD_M * (0.85)):
+                        #     kill.sleep(0.01)
+                        
+                        # # enable range fusion
+                        # z = latest_range_m(recorder)
+                        # if z is not None:
+                        #     recorder.mark("Enable RangerDeck")
+                        #     scf.cf.param.set_value("rangeFusion.enable", 1)
+                        #     mc.adjust_height(z)
+                        
+                        # go the rest of the distance
+                        while((latest_x(recorder)-xref) < FORWARD_M):
+                            kill.sleep(0.01)
+                        mc.stop()
+
+                        kill.sleep(5.0)
+                        #scf.cf.param.set_value("rangeFusion.enable", 1)
                     finally:
-                        # Back to the PID before landing, also after an abort
-                        # if use_lqr:
-                        #     set_param(scf, "lqr.use", 0)
-                        #     recorder.mark("LQR off")
-                        set_param(scf, "lqr.use", 0)              # leave the drone on the PID
-                        kill.disarm()
-                        recorder.stop()
-                        # Disable before landing, otherwise the override would keep
-                        # holding the table height while the descent starts.
-                        set_param(scf, "localMin.enable", 0)
-                        if llg is not None:
-                            llg.data_received_cb.remove_callback(lm_cb)
-                        if lqr_lg is not None:
-                            lqr_lg.data_received_cb.remove_callback(lqr_cb)
                         recorder.mark("aborted" if kill.triggered.is_set() else "landing")
 
                 recorder.mark("landed")
@@ -452,18 +450,14 @@ def main(kill, use_lqr):
 def fly_loop(kill):
     while True:
         try:
-            choice = input("Controller for this flight? [p] PID / [l] LQR "
-                           "(Ctrl+C to quit). During a flight, Space or Esc = KILL... ")
+            input("Press Enter to fly (Ctrl+C to quit). During a flight, Space or Esc = KILL... ")
         except EOFError:
             return
-        use_lqr = choice.strip().lower().startswith("l")
-        print(f"Flying with {'LQR (PID takeoff/landing)' if use_lqr else 'PID only'}")
-
         check_uri()
         kill.reset()
         kill.busy.set()
         try:
-            main(kill, use_lqr)
+            main(kill)
         except Exception:
             if kill.triggered.is_set():
                 print("Flight aborted by the kill switch.")
@@ -486,18 +480,3 @@ if __name__ == "__main__":
         fly_loop(kill)
     except KeyboardInterrupt:
         print("Exiting")
-
-        with SyncCrazyflie(URI, cf=Crazyflie(rw_cache="./cache")) as scf:
-            print("Taking off...")
-            with MotionCommander(scf, default_height=1.0) as mc:
-
-                time.sleep(5.0)
-                
-                print("Moving forward...")
-                mc.forward(1.0)
-                
-                time.sleep(2.0)
-                
-                print("Landing...")
-                lg.stop()
-                lg.delete()
