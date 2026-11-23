@@ -386,9 +386,15 @@ def main(kill):
         print(f"Connecting to {URI}...")
         with SyncCrazyflie(URI, cf=Crazyflie(rw_cache="./cache")) as scf:
             recorder.start(scf)
-            #scf.cf.param.set_value("localMin.enable", "0")
-            #scf.cf.param.set_value("rangeFusion.enable", "1")
+
+            # Enable flow deck with 1, disable with 0
+            scf.cf.param.set_value("rangeFusion.enable", "1")
+
+            # Enable lqr flight controller with 1, disable with 0
             scf.cf.param.set_value("lqr.use", "1")
+
+            # Enable angle based kill switch with 1, disable with 0
+            scf.cf.set_param(scf, "supervisor.tmblChckEn", 0)
             try:
                 # Create the commander first so the kill switch can reach it
                 # even while take-off (which blocks for several seconds) is running.
@@ -440,6 +446,8 @@ def main(kill):
 
                 recorder.mark("landed")
             finally:
+                # re-enable angle based kill switch for future runs
+                scf.cf.set_param(scf, "supervisor.tmblChckEn", 1)
                 kill.disarm()
                 recorder.stop()
     finally:
