@@ -405,10 +405,19 @@ def main(kill):
         print(f"Connecting to {URI}...")
         with SyncCrazyflie(URI, cf=Crazyflie(rw_cache="./cache")) as scf:
             recorder.start(scf)
-            #scf.cf.param.set_value("localMin.enable", "0")
+            # Sets the estimator, Auto select(0), complementary(1), extended kalman(2), **unscented kalman(3)
+            #scf.cf.param.set_value("stabilizer.estimator", 1)
+            #scf.cf.param.set_value("stabilizer.estimator", 2)
+            scf.cf.param.set_value("stabilizer.estimator", 3)
 
             # Enable flow deck with 1, disable with 0
-            scf.cf.param.set_value("rangeFusion.enable", "1")
+            scf.cf.param.set_value("rangeFusion.enable", 1)
+
+            # Enable lqr flight controller with 1, disable with 0
+            scf.cf.param.set_value("lqr.use", "1")
+
+            # Enable angle based kill switch with 1, disable with 0
+            scf.cf.param.set_value("supervisor.tmblChckEn", 0)
 
             # LQR gains and trims
             send_lqr_gains(scf, load_gains())
@@ -416,11 +425,6 @@ def main(kill):
             scf.cf.param.set_value("lqr.trimPitch", "-0.1")
             scf.cf.param.set_value("lqr.fHover", "0.65")
 
-            # Enable lqr flight controller with 1, disable with 0
-            scf.cf.param.set_value("lqr.use", "1")
-
-            # Enable angle based kill switch with 1, disable with 0
-            scf.cf.set_param(scf, "supervisor.tmblChckEn", 0)
             try:
                 # Create the commander first so the kill switch can reach it
                 # even while take-off (which blocks for several seconds) is running.
@@ -445,20 +449,20 @@ def main(kill):
                         while((latest_x(recorder)-xref) < FORWARD_M * (0.5)):
                             kill.sleep(0.01)
 
-                        # # disable range fusion
-                        # recorder.mark("Disable RangerDeck")
-                        # scf.cf.param.set_value("rangeFusion.enable", 0)
+                        # disable range fusion
+                        recorder.mark("Disable RangerDeck")
+                        scf.cf.param.set_value("rangeFusion.enable", 0)
                         
-                        # # go a quarter of the distance
-                        # while((latest_x(recorder)-xref) < FORWARD_M * (0.85)):
-                        #     kill.sleep(0.01)
+                        # go a quarter of the distance
+                        while((latest_x(recorder)-xref) < FORWARD_M * (0.85)):
+                            kill.sleep(0.01)
                         
-                        # # enable range fusion
-                        # z = latest_range_m(recorder)
-                        # if z is not None:
-                        #     recorder.mark("Enable RangerDeck")
-                        #     scf.cf.param.set_value("rangeFusion.enable", 1)
-                        #     mc.adjust_height(z)
+                        # enable range fusion
+                        z = latest_range_m(recorder)
+                        if z is not None:
+                            recorder.mark("Enable RangerDeck")
+                            scf.cf.param.set_value("rangeFusion.enable", 1)
+                            mc.adjust_height(z)
                         
                         # go the rest of the distance
                         while((latest_x(recorder)-xref) < FORWARD_M):
@@ -466,7 +470,6 @@ def main(kill):
                         mc.stop()
 
                         kill.sleep(5.0)
-                        #scf.cf.param.set_value("rangeFusion.enable", 1)
                     finally:
                         recorder.mark("aborted" if kill.triggered.is_set() else "landing")
 
@@ -474,6 +477,7 @@ def main(kill):
             finally:
                 # re-enable angle based kill switch for future runs
                 scf.cf.set_param(scf, "supervisor.tmblChckEn", 1)
+                scf.cf.param.set_value("rangeFusion.enable", 1)
                 kill.disarm()
                 recorder.stop()
     finally:
