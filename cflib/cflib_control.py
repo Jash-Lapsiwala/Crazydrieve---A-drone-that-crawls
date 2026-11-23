@@ -1,3 +1,4 @@
+import csv
 import signal
 import threading
 import time
@@ -17,10 +18,28 @@ from cflib.positioning.motion_commander import MotionCommander
 
 URI = "radio://0/80/2M"
 
-MIN_PROMINENCE_M = 0.025     # a dip and the rise after it must exceed this (keep above sensor noise)
+MIN_PROMINENCE_M = 0.025    # a dip and the rise after it must exceed this (keep above sensor noise)
 MAX_VALID_RANGE_M = 3.0     # ignore out-of-range readings from the sensor
 PRINT_ZRANGE = False        # print every raw zrange reading to the terminal
 FORWARD_M = 2.5             # distance of the forward leg in meters
+
+# LQR gain matrix K #####################################################################################################
+K_FILE = "C:\\Users\\lapsi\\Documents\\Work\\Assignments\\24-774\\Project\\MATLAB\\Quadcopter_Simulation_WSK\\K.csv"
+
+def load_gains(path=K_FILE):
+    with open(path) as f:
+        K = [[float(v) for v in row] for row in csv.reader(f)]
+    assert len(K) == 4 and all(len(r) == 12 for r in K), "K must be 4x12"
+    return K
+
+def send_lqr_gains(scf, K):
+    for i in range(4):
+        for j in range(12):
+            scf.cf.param.set_value(f"lqrK.k{i}_{j}", str(K[i][j]))
+    time.sleep(1.0)   # let the writes reach the drone
+    print(f"Sent LQR gains: kZ={K[0][2]:.4g}  kPhi={K[1][5]:.4g}")
+    
+#########################################################################################################################
 
 # True: the kill switch also sends the firmware's emergency stop, which locks the
 # motors until the Crazyflie is power-cycled. False: it only sends a stop setpoint.
@@ -388,11 +407,15 @@ def main(kill):
             recorder.start(scf)
             #scf.cf.param.set_value("localMin.enable", "0")
             #scf.cf.param.set_value("rangeFusion.enable", "1")
+            send_lqr_gains(scf, load_gains())
+            scf.cf.param.set_value("lqr.trimRoll", "-0.5")
+            scf.cf.param.set_value("lqr.trimPitch", "-0.1")
+            scf.cf.param.set_value("lqr.fHover", "0.65")
             scf.cf.param.set_value("lqr.use", "1")
             try:
                 # Create the commander first so the kill switch can reach it
                 # even while take-off (which blocks for several seconds) is running.
-                mc = MotionCommander(scf, default_height=1.25)
+                mc = MotionCommander(scf, default_height=1)
                 kill.arm(scf.cf, mc, recorder)
 
                 recorder.mark("takeoff")
