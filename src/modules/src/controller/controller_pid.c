@@ -5,10 +5,14 @@
 #include "attitude_controller.h"
 #include "position_controller.h"
 #include "controller_pid.h"
+#include "controller_lqr.h"
 
 #include "log.h"
 #include "param.h"
 #include "math3d.h"
+
+#define DEBUG_MODULE "CTRL"
+#include "debug.h"
 
 #define ATTITUDE_UPDATE_DT    (float)(1.0f/ATTITUDE_RATE)
 
@@ -76,6 +80,22 @@ void controllerPid(control_t *control, const setpoint_t *setpoint,
                                          const state_t *state,
                                          const stabilizerStep_t stabilizerStep)
 {
+  static bool wasLqr = false;
+  if (controllerLqrEnabled()) {
+    if (!wasLqr) { controllerLqrReset(state); 
+      wasLqr = true; 
+      DEBUG_PRINT("LQR ON\n");
+    }
+    controllerLqr(control, setpoint, sensors, state, stabilizerStep);
+    return;
+  }
+  if (wasLqr) { 
+    controllerPidReinitialize(state); 
+    attitudeDesired.yaw = state->attitude.yaw; 
+    wasLqr = false; 
+    DEBUG_PRINT("LQR OFF\n");
+  }
+
   control->controlMode = controlModeLegacy;
 
   if (setpointModeChanged(setpoint)) {

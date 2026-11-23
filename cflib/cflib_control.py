@@ -16,6 +16,8 @@ from cflib.positioning.motion_commander import MotionCommander
 
 URI = "radio://0/80/2M"
 
+LQR_SETTLE_S = 3.0 
+
 # Table-edge detection now runs in the firmware (localMin module). This is the
 # range jump between two consecutive ToF readings that counts as an edge. Set it
 # to about half the table height; it is sent to localMin.stepThresh each flight.
@@ -69,6 +71,13 @@ LOG_GROUPS = [
         ("localMin.target", "float"),
         ("localMin.overTable", "uint8_t"),
         ("localMin.count", "uint8_t"),
+    ]),
+    
+        ("LQR", 20, [
+        ("lqr.cmd_thrust", "float"),
+        ("lqr.dT", "float"),
+        ("lqr.tauX", "float"),
+        ("lqr.tauY", "float"),
     ]),
 ]
 
@@ -320,6 +329,18 @@ def make_localmin_callback(recorder):
 
     return on_data
 
+def make_lqr_print_callback():
+    """Prints the LQR output every 0.5 s (25 samples at 20 ms)."""
+    n = {"i": 0}
+
+    def on_data(timestamp, data, logconf):
+        n["i"] += 1
+        if n["i"] % 25 == 0:
+            print(f"LQR thrust {data['lqr.cmd_thrust']:6.0f}  "
+                  f"dT {data['lqr.dT']:+.3f} N  "
+                  f"tauX {data['lqr.tauX']:+.4f}  tauY {data['lqr.tauY']:+.4f}")
+
+    return on_data
 
 def check_uri():
     available = crtp.scan_interfaces()
@@ -331,7 +352,7 @@ def check_uri():
         print(f"Available URI: {uri} ({name})")
 
 
-def main(kill):
+def main(kill, use_lqr):
     recorder = FlightRecorder()
     filename = f"flight_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
 
@@ -339,6 +360,14 @@ def main(kill):
         print(f"Connecting to {URI}...")
         with SyncCrazyflie(URI, cf=Crazyflie(rw_cache="./cache")) as scf:
             recorder.start(scf)
+
+            # Drone console (DEBUG_PRINT) in this terminal, e.g. "CTRL: LQR ON"
+            scf.cf.console.receivedChar.add_callback(
+                lambda text: print(f"[drone] {text}", end=""))
+
+            # Always start on the PID, whatever the drone was left on
+            set_param(scf, "lqr.use", 0)
+
             try:
                 # Create the commander first so the kill switch can reach it
                 # even while take-off (which blocks for several seconds) is running.
@@ -346,6 +375,11 @@ def main(kill):
                 mc = MotionCommander(scf, default_height=1.25)
                 kill.arm(scf.cf, mc, recorder)
 
+                # recorder.mark("takeoff")
+                # kill.check()
+                if use_lqr:
+                    set_param(scf, "lqr.use", 1)          # LQR for the whole flight
+                    recorder.mark("LQR on")
                 recorder.mark("takeoff")
                 kill.check()
                 with mc:
@@ -358,14 +392,28 @@ def main(kill):
                     else:
                         print("WARNING: no LocalMin log block")
 
+                    lqr_lg = recorder.log_configs.get("LQR")
+                    lqr_cb = make_lqr_print_callback()
+                    if lqr_lg is not None:
+                        lqr_lg.data_received_cb.add_callback(lqr_cb)
+                    else:
+                        print("WARNING: no LQR log block (is the LQR firmware flashed?)")
+
                     try:
                         # Threshold first, so the first enabled tick already uses it.
                         # The firmware detector starts fresh when enabled.
                         set_param(scf, "localMin.stepThresh", STEP_THRESH_M)
-                        
+
                         set_param(scf, "localMin.enable", 1)
                         recorder.mark(f"localMin enabled (stepThresh {STEP_THRESH_M} m)")
 
+                        # if use_lqr:
+                        #     kill.sleep(LQR_SETTLE_S)          # settle on the PID first
+                        #     set_param(scf, "lqr.use", 1)
+                        #     recorder.mark("LQR on")
+                        #     kill.sleep(5.0 - LQR_SETTLE_S)
+                        # else:
+                        #     kill.sleep(5.0)
                         kill.sleep(5.0)
 
                         # Same as mc.forward(), but the wait can be interrupted
@@ -376,11 +424,20 @@ def main(kill):
 
                         kill.sleep(10.0)
                     finally:
+                        # Back to the PID before landing, also after an abort
+                        # if use_lqr:
+                        #     set_param(scf, "lqr.use", 0)
+                        #     recorder.mark("LQR off")
+                        set_param(scf, "lqr.use", 0)              # leave the drone on the PID
+                        kill.disarm()
+                        recorder.stop()
                         # Disable before landing, otherwise the override would keep
                         # holding the table height while the descent starts.
                         set_param(scf, "localMin.enable", 0)
                         if llg is not None:
                             llg.data_received_cb.remove_callback(lm_cb)
+                        if lqr_lg is not None:
+                            lqr_lg.data_received_cb.remove_callback(lqr_cb)
                         recorder.mark("aborted" if kill.triggered.is_set() else "landing")
 
                 recorder.mark("landed")
@@ -395,14 +452,18 @@ def main(kill):
 def fly_loop(kill):
     while True:
         try:
-            input("Press Enter to fly (Ctrl+C to quit). During a flight, Space or Esc = KILL... ")
+            choice = input("Controller for this flight? [p] PID / [l] LQR "
+                           "(Ctrl+C to quit). During a flight, Space or Esc = KILL... ")
         except EOFError:
             return
+        use_lqr = choice.strip().lower().startswith("l")
+        print(f"Flying with {'LQR (PID takeoff/landing)' if use_lqr else 'PID only'}")
+
         check_uri()
         kill.reset()
         kill.busy.set()
         try:
-            main(kill)
+            main(kill, use_lqr)
         except Exception:
             if kill.triggered.is_set():
                 print("Flight aborted by the kill switch.")
@@ -425,8 +486,6 @@ if __name__ == "__main__":
         fly_loop(kill)
     except KeyboardInterrupt:
         print("Exiting")
-
-
 
         with SyncCrazyflie(URI, cf=Crazyflie(rw_cache="./cache")) as scf:
             print("Taking off...")
